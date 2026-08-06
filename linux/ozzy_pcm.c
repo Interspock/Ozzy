@@ -517,6 +517,16 @@ static int ozzy_pcm_init_out_urb(struct pcm_urb *urb, struct ozzy_chip *chip)
 	unsigned int pkt_size;
 
 	urb->chip = chip;
+
+	/*
+	 * Reinitialization after USB reset.
+	 */
+	if (urb->buffer) {
+	    usb_unpoison_urb(&urb->instance);
+	    kfree(urb->buffer);
+	    urb->buffer = NULL;
+	}
+
 	usb_init_urb(&urb->instance);
 
 	/* Get packet size (may differ for bulk vs interrupt) */
@@ -564,11 +574,24 @@ static int ozzy_pcm_init_in_urb(struct pcm_urb *urb, struct ozzy_chip *chip)
 	const struct ozzy_device_info *info = chip->info;
 
 	urb->chip = chip;
+
+	/*
+	 * On post-reset this URB may already exist and have been poisoned.
+	 * Release its old transfer buffer and make it usable again.
+	 */
+	if (urb->buffer) {
+	    usb_unpoison_urb(&urb->instance);
+	    kfree(urb->buffer);
+	    urb->buffer = NULL;
+	}
+
 	usb_init_urb(&urb->instance);
 
 	urb->buffer = kzalloc(info->in_packet_size, GFP_KERNEL);
 	if (!urb->buffer)
-		return -ENOMEM;
+	    return -ENOMEM;
+		if (!urb->buffer)
+			return -ENOMEM;
 
 	if ((chip->dev->ep_in[info->in_ep]->desc.bmAttributes &
 	     USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK) {
@@ -604,6 +627,12 @@ int ozzy_pcm_init_urbs(struct ozzy_chip *chip)
 	int ret;
 
 	rt->chip = chip;
+	/*
+	 * A USB reset uses ozzy_pcm_abort(), which sets panic=true.
+	 * At this point the device has been reinitialized and the URBs
+	 * are about to be recreated, so the PCM engine is usable again.
+	 */
+	rt->panic = false;
 
 	/* Initialize input URBs */
 	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
@@ -650,9 +679,13 @@ error_locked:
 	mutex_unlock(&rt->stream_mutex);
 error:
 	ozzy_pcm_err(&chip->dev->dev, "PCM URB initialization failed\n");
+
 	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
-		kfree(rt->pcm_out_urbs[i].buffer);
-		kfree(rt->pcm_in_urbs[i].buffer);
+	    kfree(rt->pcm_out_urbs[i].buffer);
+	    rt->pcm_out_urbs[i].buffer = NULL;
+
+	    kfree(rt->pcm_in_urbs[i].buffer);
+	    rt->pcm_in_urbs[i].buffer = NULL;
 	}
 	return ret;
 }

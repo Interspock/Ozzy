@@ -190,10 +190,24 @@ static int ploytec_init(struct ozzy_chip *chip)
 	struct ploytec_private *priv;
 	int ret;
 
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-	chip->private_data = priv;
+
+
+
+    priv = chip->private_data;
+
+    if (!priv) {
+        priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+        if (!priv)
+            return -ENOMEM;
+
+        chip->private_data = priv;
+    } else {
+        memset(priv->firmware_ver, 0, sizeof(priv->firmware_ver));
+        memset(priv->status, 0, sizeof(priv->status));
+        memset(priv->xfer_buf, 0, sizeof(priv->xfer_buf));
+    }
+
+
 
 	ploytec_log(&chip->dev->dev, "--- begin handshake sequence ---\n");
 
