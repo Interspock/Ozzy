@@ -661,6 +661,7 @@ int ozzy_pcm_init_urbs(struct ozzy_chip *chip)
 		}
 	}
 
+
 	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
 		usb_anchor_urb(&rt->pcm_out_urbs[i].instance,
 			       &rt->pcm_out_urbs[i].submitted);
@@ -671,6 +672,7 @@ int ozzy_pcm_init_urbs(struct ozzy_chip *chip)
 			goto error_locked;
 		}
 	}
+
 	mutex_unlock(&rt->stream_mutex);
 
 	return 0;

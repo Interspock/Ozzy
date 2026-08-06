@@ -533,10 +533,52 @@ static unsigned int ploytec_get_out_packet_size(struct ozzy_chip *chip, bool is_
 #define AUDIOLINK_ALSA_PACKET_SIZE  \
     (AUDIOLINK_FRAMES_PER_PACKET * AUDIOLINK_ALSA_FRAME_SIZE)
 
-
 #define AUDIOLINK_OUT_FRAMES        10
 #define AUDIOLINK_OUT_FRAME_SIZE    48
-#define AUDIOLINK_ALSA_OUT_FRAME    (4 * 3)   /* 4ch x S24_3LE */
+#define AUDIOLINK_ALSA_OUT_FRAME    (AUDIOLINK_CHANNELS * 3)
+
+/*
+ * MIDIPLUS AudioLink Plus II / Ploytec bulk 4-channel encoder.
+ *
+ * This mirrors the official driver's dmaEncode04_C routine:
+ *
+ *   10 sample instants per USB bulk packet
+ *   48 bytes per sample instant
+ *
+ *   dst[ 0..23] = CH1 in bit 0, CH3 in bit 1
+ *   dst[24..47] = CH2 in bit 0, CH4 in bit 1
+ *
+ * The 24 significant sample bits are emitted MSB first (bit 23 -> bit 0).
+ * ALSA supplies packed S24_3LE, so each channel is reconstructed as an
+ * unsigned 24-bit word solely for bit extraction.
+ */
+static uint32_t audiolink_get_s24le(const uint8_t *p)
+{
+    return ((uint32_t)p[0]) |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16);
+}
+
+static void audiolink_encode_frame(uint8_t *dst, const uint8_t *src)
+{
+    uint32_t ch1 = audiolink_get_s24le(src + 0);
+    uint32_t ch2 = audiolink_get_s24le(src + 3);
+    uint32_t ch3 = audiolink_get_s24le(src + 6);
+    uint32_t ch4 = audiolink_get_s24le(src + 9);
+    unsigned int i;
+
+    for (i = 0; i < 24; i++) {
+        unsigned int shift = 23 - i;
+
+        dst[i] =
+            (uint8_t)(((ch1 >> shift) & 0x01) |
+                      (((ch3 >> shift) & 0x01) << 1));
+
+        dst[24 + i] =
+            (uint8_t)(((ch2 >> shift) & 0x01) |
+                      (((ch4 >> shift) & 0x01) << 1));
+    }
+}
 
 static unsigned int audiolink_process_out_packet(
     struct ozzy_chip *chip,
@@ -547,77 +589,43 @@ static unsigned int audiolink_process_out_packet(
 {
     unsigned int f;
     unsigned int src_off;
-    uint8_t pcm8[24];
 
-    /*
-     * One AudioLink bulk transfer:
-     *
-     *   10 x 48-byte Ploytec frames = 480 bytes
-     *   byte 480 = MIDI idle
-     *   byte 481 = sync
-     *   bytes 482..511 = padding
-     */
     memset(urb_buf, 0, AUDIOLINK_OUT_PACKET_SIZE);
 
-    urb_buf[480] = PLOYTEC_MIDI_IDLE_BYTE;
-    urb_buf[481] = 0xFF;
-
     for (f = 0; f < AUDIOLINK_OUT_FRAMES; f++) {
+        uint8_t frame[12];
+        uint8_t *src;
 
-        src_off =
-            dma_off + f * AUDIOLINK_ALSA_OUT_FRAME;
+        src_off = dma_off + f * AUDIOLINK_ALSA_OUT_FRAME;
 
-        if (src_off >= pcm_buffer_size)
+        while (src_off >= pcm_buffer_size)
             src_off -= pcm_buffer_size;
 
-        /*
-         * ploytec_encode_frame() espera:
-         * 8 canales x 3 bytes = 24 bytes.
-         *
-         * AudioLink entrega 4 canales ALSA.
-         * CH5..CH8 se mandan como silencio.
-         */
-        memset(pcm8, 0, sizeof(pcm8));
-
-        if (src_off + AUDIOLINK_ALSA_OUT_FRAME
-            <= pcm_buffer_size) {
-
-            memcpy(
-                pcm8,
-                dma_area + src_off,
-                AUDIOLINK_ALSA_OUT_FRAME
-            );
-
+        if (src_off + AUDIOLINK_ALSA_OUT_FRAME <= pcm_buffer_size) {
+            src = dma_area + src_off;
         } else {
+            unsigned int first = pcm_buffer_size - src_off;
 
-            unsigned int first =
-                pcm_buffer_size - src_off;
-
-            memcpy(
-                pcm8,
-                dma_area + src_off,
-                first
-            );
-
-            memcpy(
-                pcm8 + first,
-                dma_area,
-                AUDIOLINK_ALSA_OUT_FRAME - first
-            );
+            memcpy(frame, dma_area + src_off, first);
+            memcpy(frame + first, dma_area,
+                   AUDIOLINK_ALSA_OUT_FRAME - first);
+            src = frame;
         }
 
-        ploytec_encode_frame(
+        audiolink_encode_frame(
             urb_buf + f * AUDIOLINK_OUT_FRAME_SIZE,
-            pcm8
+            src
         );
     }
 
     /*
-     * ALSA bytes consumidos:
-     * 10 frames x 4 canales x 3 bytes.
+     * 10 * 48 = 480 bytes audio.
+     * Official Ploytec bulk trailer / idle framing.
      */
-    return AUDIOLINK_OUT_FRAMES *
-           AUDIOLINK_ALSA_OUT_FRAME;
+    urb_buf[480] = PLOYTEC_MIDI_IDLE_BYTE;
+    urb_buf[481] = 0xFF;
+
+    return AUDIOLINK_OUT_FRAMES * AUDIOLINK_ALSA_OUT_FRAME;
 }
 
 static unsigned int audiolink_process_in_packet(
@@ -632,50 +640,27 @@ static unsigned int audiolink_process_in_packet(
     uint8_t decoded[24];
 
     for (f = 0; f < AUDIOLINK_FRAMES_PER_PACKET; f++) {
-
-        /*
-         * Decoder Ploytec existente:
-         * 64 bytes device -> 8 x 24-bit PCM.
-         *
-         * En AudioLink sólo usamos CH1..CH4,
-         * es decir los primeros 12 bytes.
-         */
         ploytec_decode_frame(
             decoded,
             urb_buf + f * AUDIOLINK_IN_FRAME_SIZE
         );
 
-        dst_off =
-            dma_off + f * AUDIOLINK_ALSA_FRAME_SIZE;
+        dst_off = dma_off + f * AUDIOLINK_ALSA_FRAME_SIZE;
 
         if (dst_off >= pcm_buffer_size)
             dst_off -= pcm_buffer_size;
 
-        if (dst_off + AUDIOLINK_ALSA_FRAME_SIZE
-            <= pcm_buffer_size) {
-
-            memcpy(
-                dma_area + dst_off,
-                decoded,
-                AUDIOLINK_ALSA_FRAME_SIZE
-            );
-
+        if (dst_off + AUDIOLINK_ALSA_FRAME_SIZE <= pcm_buffer_size) {
+            memcpy(dma_area + dst_off,
+                   decoded,
+                   AUDIOLINK_ALSA_FRAME_SIZE);
         } else {
+            unsigned int first = pcm_buffer_size - dst_off;
 
-            unsigned int first =
-                pcm_buffer_size - dst_off;
-
-            memcpy(
-                dma_area + dst_off,
-                decoded,
-                first
-            );
-
-            memcpy(
-                dma_area,
-                decoded + first,
-                AUDIOLINK_ALSA_FRAME_SIZE - first
-            );
+            memcpy(dma_area + dst_off, decoded, first);
+            memcpy(dma_area,
+                   decoded + first,
+                   AUDIOLINK_ALSA_FRAME_SIZE - first);
         }
     }
 
@@ -687,10 +672,6 @@ static void audiolink_init_out_urb(
     uint8_t *buffer)
 {
     memset(buffer, 0, AUDIOLINK_OUT_PACKET_SIZE);
-
-    /*
-     * Ploytec bulk sub-packet trailer.
-     */
     buffer[480] = PLOYTEC_MIDI_IDLE_BYTE;
     buffer[481] = 0xFF;
 }
@@ -701,6 +682,7 @@ static unsigned int audiolink_get_out_packet_size(
 {
     return AUDIOLINK_OUT_PACKET_SIZE;
 }
+
 
 const struct ozzy_device_info ploytec_info = {
 	.name                  = "Ploytec Xone",
