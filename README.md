@@ -10,7 +10,7 @@ This is an open-source, reverse-engineered driver supporting non-class compliant
 
 **Currently Supported Devices:**
 * **Allen & Heath Xone:DB4, DB2, DX, 4D** (Ploytec-based protocol)
-* **MIDIPLUS AudioLink Plus II / AudioLink Plus 4x4** (`1acc:0103`, Ploytec OEM protocol) — Linux capture validated; playback experimental
+* **MIDIPLUS AudioLink Plus II / AudioLink Plus 4x4** (`1acc:0103`, Ploytec OEM protocol) — Linux 4-channel capture and playback validated
 
 More devices can be added—the architecture separates the audio engine from device protocols.
 
@@ -39,22 +39,25 @@ Ozzy reverses the protocol and provides modern drivers—so your equipment keeps
 | **Allen & Heath Xone:DB2** | 8×8 | 44.1/48/88.2/96 kHz | ✅ Perfect |
 | **Allen & Heath Xone:DX** | 8×8 | 44.1/48/88.2/96 kHz | ✅ Perfect |
 | **Allen & Heath Xone:4D** | 8×8 | 44.1/48/88.2/96 kHz | ✅ Perfect |
-| **MIDIPLUS AudioLink Plus II / 4x4** | 4 in / 4 out | 44.1/48/88.2/96 kHz | ✅ Linux capture validated; 🚧 playback experimental |
+| **MIDIPLUS AudioLink Plus II / 4x4** | 4 in / 4 out | 44.1/48/88.2/96 kHz | ✅ Linux capture and playback validated |
 
 ### MIDIPLUS AudioLink Plus II status
 
-Support for the MIDIPLUS interface is currently implemented on Linux for USB ID `1acc:0103`.
+Support for the MIDIPLUS interface is implemented on Linux for USB ID `1acc:0103`.
 
 Validated on real hardware:
 
 * **Capture:** 4 channels, `S24_3LE`
-* **Sample rates:** 44.1, 48, 88.2 and 96 kHz
+* **Playback:** 4 channels, `S24_3LE`, acoustically validated on real hardware
+* **Sample rates:** 44.1, 48, 88.2 and 96 kHz for both capture and playback
 * **Dynamic sample-rate switching:** validated repeatedly across USB resets and full vendor re-handshakes
-* **USB transport:** vendor-specific Ploytec-style bulk streaming (`EP 0x86` capture / `EP 0x05` playback clock traffic)
-* **Playback:** ALSA playback device is registered and an experimental 4-channel encoder path exists, but acoustic output is **not yet validated**
+* **USB transport:** vendor-specific Ploytec-style bulk streaming (`EP 0x86` capture / `EP 0x05` playback)
+* **Playback framing:** 10 sample instants × 48 wire bytes, MSB-first bit-plane packing, followed by the Ploytec bulk trailer
 * **MIDI:** not yet enabled for the AudioLink profile
 
-The AudioLink is not USB Audio Class compliant. The Linux driver performs the Ploytec vendor handshake, sample-rate control and bit-interleaved PCM decoding directly.
+The AudioLink is not USB Audio Class compliant. The Linux driver performs the Ploytec vendor handshake, sample-rate control and device-specific bit-interleaved PCM encoding/decoding directly.
+
+Detailed protocol notes and validation results are in [`docs/MIDIPLUS-AudioLink-Plus-II.md`](docs/MIDIPLUS-AudioLink-Plus-II.md).
 
 ---
 
@@ -90,9 +93,9 @@ All backends share the same CoreAudio HAL and CoreMIDI drivers—only the USB co
 
 ### 🐧 Linux (ALSA Kernel Module)
 Standard ALSA kernel module with automatic transfer mode detection.
-* **Audio:** device-specific PCM channel counts; Xone devices use 8×8, MIDIPLUS AudioLink uses 4-channel capture and experimental 4-channel playback
-* **MIDI:** ALSA Sequencer In/Out where enabled by the device profile
-* **Modes:** Automatic BULK/INTERRUPT transfer detection for existing Ploytec profiles; AudioLink uses the validated bulk endpoint topology
+* **Audio:** device-specific PCM channel counts; Xone devices use 8×8, MIDIPLUS AudioLink uses validated 4-channel capture and 4-channel playback
+* **MIDI:** ALSA Sequencer In/Out where enabled by the device profile; AudioLink MIDI is not yet enabled
+* **Modes:** Automatic BULK/INTERRUPT transfer detection for existing Ploytec profiles; AudioLink uses its validated bulk endpoint topology
 * **Integration:** ALSA-native; usable from JACK, PulseAudio and PipeWire
 * **Location:** [`linux/`](linux/)
 
@@ -147,7 +150,7 @@ For detailed information, see [macos/README.md](macos/README.md)
     sudo modprobe snd-usb-ozzy
     ```
 
-For the current MIDIPLUS AudioLink work, use the `audiolink-midiplus` branch of this fork:
+For MIDIPLUS AudioLink support, use the `audiolink-midiplus` branch of this fork:
 
 ```bash
 git clone https://github.com/Interspock/Ozzy.git
@@ -159,6 +162,16 @@ sudo insmod ./snd-usb-ozzy.ko
 ```
 
 The AudioLink profile has been tested on Linux kernel `5.4.0-216-generic`. Compatibility shims in this branch also cover older ALSA/kernel APIs used by that kernel series.
+
+Basic AudioLink tests:
+
+```bash
+# Capture: four channels at 44.1 kHz
+arecord -D hw:1,0 -c 4 -r 44100 -f S24_3LE -d 10 capture.wav
+
+# Playback: four channels at 44.1 kHz
+aplay -D hw:1,0 -c 4 -r 44100 -f S24_3LE playback.wav
+```
 
 ---
 
@@ -359,9 +372,10 @@ Whether you need to support your own legacy hardware or understand how professio
 **MIDIPLUS AudioLink troubleshooting:**
 - Verify USB ID: `lsusb | grep 1acc:0103`
 - Verify capture device: `arecord -l`
-- Verify playback registration: `aplay -l`
+- Verify playback device: `aplay -l`
 - Capture test: `arecord -D hw:1,0 -f S24_3LE -c 4 -r 44100 -d 10 test.wav`
-- Playback is currently experimental on this branch; keep output volume low during validation
+- Playback test: `aplay -D hw:1,0 -f S24_3LE -c 4 -r 44100 test-4ch.wav`
+- If PulseAudio owns the device, prefix playback tests with `pasuspender --`
 
 **Reporting Issues:**
 When filing a bug report, please include:
