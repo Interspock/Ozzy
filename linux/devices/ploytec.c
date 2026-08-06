@@ -533,6 +533,93 @@ static unsigned int ploytec_get_out_packet_size(struct ozzy_chip *chip, bool is_
 #define AUDIOLINK_ALSA_PACKET_SIZE  \
     (AUDIOLINK_FRAMES_PER_PACKET * AUDIOLINK_ALSA_FRAME_SIZE)
 
+
+#define AUDIOLINK_OUT_FRAMES        10
+#define AUDIOLINK_OUT_FRAME_SIZE    48
+#define AUDIOLINK_ALSA_OUT_FRAME    (4 * 3)   /* 4ch x S24_3LE */
+
+static unsigned int audiolink_process_out_packet(
+    struct ozzy_chip *chip,
+    uint8_t *urb_buf,
+    uint8_t *dma_area,
+    unsigned int dma_off,
+    unsigned int pcm_buffer_size)
+{
+    unsigned int f;
+    unsigned int src_off;
+    uint8_t pcm8[24];
+
+    /*
+     * One AudioLink bulk transfer:
+     *
+     *   10 x 48-byte Ploytec frames = 480 bytes
+     *   byte 480 = MIDI idle
+     *   byte 481 = sync
+     *   bytes 482..511 = padding
+     */
+    memset(urb_buf, 0, AUDIOLINK_OUT_PACKET_SIZE);
+
+    urb_buf[480] = PLOYTEC_MIDI_IDLE_BYTE;
+    urb_buf[481] = 0xFF;
+
+    for (f = 0; f < AUDIOLINK_OUT_FRAMES; f++) {
+
+        src_off =
+            dma_off + f * AUDIOLINK_ALSA_OUT_FRAME;
+
+        if (src_off >= pcm_buffer_size)
+            src_off -= pcm_buffer_size;
+
+        /*
+         * ploytec_encode_frame() espera:
+         * 8 canales x 3 bytes = 24 bytes.
+         *
+         * AudioLink entrega 4 canales ALSA.
+         * CH5..CH8 se mandan como silencio.
+         */
+        memset(pcm8, 0, sizeof(pcm8));
+
+        if (src_off + AUDIOLINK_ALSA_OUT_FRAME
+            <= pcm_buffer_size) {
+
+            memcpy(
+                pcm8,
+                dma_area + src_off,
+                AUDIOLINK_ALSA_OUT_FRAME
+            );
+
+        } else {
+
+            unsigned int first =
+                pcm_buffer_size - src_off;
+
+            memcpy(
+                pcm8,
+                dma_area + src_off,
+                first
+            );
+
+            memcpy(
+                pcm8 + first,
+                dma_area,
+                AUDIOLINK_ALSA_OUT_FRAME - first
+            );
+        }
+
+        ploytec_encode_frame(
+            urb_buf + f * AUDIOLINK_OUT_FRAME_SIZE,
+            pcm8
+        );
+    }
+
+    /*
+     * ALSA bytes consumidos:
+     * 10 frames x 4 canales x 3 bytes.
+     */
+    return AUDIOLINK_OUT_FRAMES *
+           AUDIOLINK_ALSA_OUT_FRAME;
+}
+
 static unsigned int audiolink_process_in_packet(
     struct ozzy_chip *chip,
     uint8_t *urb_buf,
@@ -599,11 +686,13 @@ static void audiolink_init_out_urb(
     struct ozzy_chip *chip,
     uint8_t *buffer)
 {
-    /*
-     * Esto reproduce exactamente el probe que funcionó:
-     * 512 bytes de cero sostenidos sobre EP 0x05.
-     */
     memset(buffer, 0, AUDIOLINK_OUT_PACKET_SIZE);
+
+    /*
+     * Ploytec bulk sub-packet trailer.
+     */
+    buffer[480] = PLOYTEC_MIDI_IDLE_BYTE;
+    buffer[481] = 0xFF;
 }
 
 static unsigned int audiolink_get_out_packet_size(
@@ -655,13 +744,13 @@ const struct ozzy_device_info audiolink_info = {
      * De momento dejamos playback en 0:
      * queremos validar captura antes de tocar el encoder OUT.
      */
-    .playback_channels     = 0,
+    .playback_channels     = 4,
     .capture_channels      = 4,
 
     .out_packet_size       = AUDIOLINK_OUT_PACKET_SIZE,
     .in_packet_size        = AUDIOLINK_IN_PACKET_SIZE,
 
-    .frames_per_out_packet = 8,
+    .frames_per_out_packet = 10,
     .frames_per_in_packet  = 8,
 
     .out_ep                = 0x05,
@@ -705,7 +794,7 @@ const struct ozzy_device_ops audiolink_ops = {
     /*
      * Playback todavía no.
      */
-    .process_out_packet  = NULL,
+    .process_out_packet  = audiolink_process_out_packet,
 
     .process_in_packet   = audiolink_process_in_packet,
 
