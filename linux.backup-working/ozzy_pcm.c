@@ -1,0 +1,722 @@
+// SPDX-License-Identifier: MIT
+/*
+ * Ozzy USB Audio Driver - PCM Subsystem
+ *
+ * Device-agnostic ALSA PCM implementation. Handles URB lifecycle,
+ * ALSA ops, and DMA ring buffer management. Actual audio encoding/
+ * decoding is delegated to device ops (process_out_packet / process_in_packet).
+ *
+ * Copyright (C) 2024 Marcel Bierling <marcel@hackerman.art>
+ */
+
+#include <linux/slab.h>
+#include <sound/pcm.h>
+
+#include "ozzy.h"
+#include "ozzy_log.h"
+#include "ozzy_pcm.h"
+
+/* ========================================================================
+ * Stream State Management
+ * ======================================================================== */
+
+/*
+ * ozzy_pcm_get_substream - Map an ALSA substream to our internal struct.
+ */
+static struct pcm_substream *ozzy_pcm_get_substream(struct snd_pcm_substream *alsa_sub)
+{
+	struct pcm_runtime *rt = snd_pcm_substream_chip(alsa_sub);
+
+	if (alsa_sub->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		return &rt->playback;
+	else if (alsa_sub->stream == SNDRV_PCM_STREAM_CAPTURE)
+		return &rt->capture;
+
+	ozzy_pcm_err(&rt->chip->dev->dev, "Invalid PCM stream type\n");
+	return NULL;
+}
+
+/*
+ * ozzy_pcm_stream_stop - Transition stream to disabled state.
+ */
+static void ozzy_pcm_stream_stop(struct pcm_runtime *rt)
+{
+	if (rt->stream_state != STREAM_DISABLED) {
+		rt->stream_state = STREAM_STOPPING;
+		rt->stream_state = STREAM_DISABLED;
+	}
+}
+
+/*
+ * ozzy_pcm_stream_start - Transition stream to running state.
+ * Call with stream_mutex held.
+ */
+static int ozzy_pcm_stream_start(struct pcm_runtime *rt)
+{
+	if (rt->stream_state == STREAM_DISABLED) {
+		rt->panic = false;
+		rt->stream_state = STREAM_STARTING;
+		rt->stream_state = STREAM_RUNNING;
+	}
+	return 0;
+}
+
+/* ========================================================================
+ * URB Lifecycle
+ * ======================================================================== */
+
+/*
+ * ozzy_pcm_kill_urbs - Kill all PCM URBs (waits for completion).
+ */
+static void ozzy_pcm_kill_urbs(struct pcm_runtime *rt)
+{
+	int i, time;
+
+	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
+		time = usb_wait_anchor_empty_timeout(&rt->pcm_in_urbs[i].submitted, 100);
+		if (!time)
+			usb_kill_anchored_urbs(&rt->pcm_in_urbs[i].submitted);
+		time = usb_wait_anchor_empty_timeout(&rt->pcm_out_urbs[i].submitted, 100);
+		if (!time)
+			usb_kill_anchored_urbs(&rt->pcm_out_urbs[i].submitted);
+		usb_kill_urb(&rt->pcm_in_urbs[i].instance);
+		usb_kill_urb(&rt->pcm_out_urbs[i].instance);
+	}
+}
+
+/*
+ * ozzy_pcm_poison_urbs - Poison all PCM URBs (prevents resubmission).
+ */
+static void ozzy_pcm_poison_urbs(struct pcm_runtime *rt)
+{
+	int i, time;
+
+	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
+		time = usb_wait_anchor_empty_timeout(&rt->pcm_in_urbs[i].submitted, 100);
+		if (!time)
+			usb_kill_anchored_urbs(&rt->pcm_in_urbs[i].submitted);
+		time = usb_wait_anchor_empty_timeout(&rt->pcm_out_urbs[i].submitted, 100);
+		if (!time)
+			usb_kill_anchored_urbs(&rt->pcm_out_urbs[i].submitted);
+		usb_poison_urb(&rt->pcm_in_urbs[i].instance);
+		usb_poison_urb(&rt->pcm_out_urbs[i].instance);
+	}
+}
+
+/* ========================================================================
+ * URB Completion Handlers
+ * ======================================================================== */
+
+/*
+ * ozzy_pcm_in_urb_handler - Input URB completion handler.
+ * Calls the device's process_in_packet to decode audio into the ALSA DMA area.
+ */
+static void ozzy_pcm_in_urb_handler(struct urb *usb_urb)
+{
+	struct pcm_urb *in_urb = usb_urb->context;
+	struct ozzy_chip *chip = in_urb->chip;
+	struct pcm_runtime *rt = chip->pcm;
+	struct pcm_substream *sub;
+	bool do_period_elapsed = false;
+	unsigned long flags;
+	unsigned int bytes;
+	int ret;
+
+	if (rt->panic || rt->stream_state == STREAM_STOPPING)
+		return;
+
+	if (unlikely(usb_urb->status == -ENOENT ||
+		     usb_urb->status == -ENODEV ||
+		     usb_urb->status == -ECONNRESET ||
+		     usb_urb->status == -ESHUTDOWN))
+		goto in_fail;
+
+	sub = &rt->capture;
+	spin_lock_irqsave(&sub->lock, flags);
+	if (sub->active) {
+		struct snd_pcm_runtime *alsa_rt = sub->instance->runtime;
+		unsigned int pcm_buffer_size = snd_pcm_lib_buffer_bytes(sub->instance);
+
+		bytes = chip->ops->process_in_packet(chip, in_urb->buffer,
+						     alsa_rt->dma_area,
+						     sub->dma_off,
+						     pcm_buffer_size);
+
+		sub->dma_off += bytes;
+		if (sub->dma_off >= pcm_buffer_size)
+			sub->dma_off -= pcm_buffer_size;
+
+		sub->period_off += bytes;
+		if (sub->period_off >= alsa_rt->period_size) {
+			sub->period_off %= alsa_rt->period_size;
+			do_period_elapsed = true;
+		}
+	}
+	spin_unlock_irqrestore(&sub->lock, flags);
+
+	if (do_period_elapsed)
+		snd_pcm_period_elapsed(sub->instance);
+
+	ret = usb_submit_urb(&in_urb->instance, GFP_ATOMIC);
+	if (ret < 0)
+		goto in_fail;
+
+	return;
+
+in_fail:
+	ozzy_pcm_err(&chip->dev->dev, "PCM input URB failure\n");
+	rt->panic = true;
+}
+
+/*
+ * ozzy_pcm_out_urb_handler - Output URB completion handler.
+ * Unified handler for both bulk and interrupt output. Calls device's
+ * process_out_packet for audio and fill_midi_out for embedded MIDI.
+ */
+static void ozzy_pcm_out_urb_handler(struct urb *usb_urb)
+{
+	struct pcm_urb *out_urb = usb_urb->context;
+	struct ozzy_chip *chip = out_urb->chip;
+	struct pcm_runtime *rt = chip->pcm;
+	struct pcm_substream *sub;
+	bool do_period_elapsed = false;
+	unsigned long flags;
+	unsigned int bytes;
+	int ret;
+
+	if (rt->panic || rt->stream_state == STREAM_STOPPING)
+		return;
+
+	if (unlikely(usb_urb->status == -ENOENT ||
+		     usb_urb->status == -ENODEV ||
+		     usb_urb->status == -ECONNRESET ||
+		     usb_urb->status == -ESHUTDOWN))
+		goto out_fail;
+
+	sub = &rt->playback;
+	spin_lock_irqsave(&sub->lock, flags);
+	if (sub->active) {
+		struct snd_pcm_runtime *alsa_rt = sub->instance->runtime;
+		unsigned int pcm_buffer_size = snd_pcm_lib_buffer_bytes(sub->instance);
+
+		bytes = chip->ops->process_out_packet(chip, out_urb->buffer,
+						      alsa_rt->dma_area,
+						      sub->dma_off,
+						      pcm_buffer_size);
+
+		sub->dma_off += bytes;
+		if (sub->dma_off >= pcm_buffer_size)
+			sub->dma_off -= pcm_buffer_size;
+
+		sub->period_off += bytes;
+		if (sub->period_off >= alsa_rt->period_size) {
+			sub->period_off %= alsa_rt->period_size;
+			do_period_elapsed = true;
+		}
+	} else {
+		/* No active playback -- re-initialize silence pattern */
+		chip->ops->init_out_urb(chip, out_urb->buffer);
+	}
+	spin_unlock_irqrestore(&sub->lock, flags);
+
+	if (do_period_elapsed)
+		snd_pcm_period_elapsed(sub->instance);
+
+	/* Embed pending MIDI output bytes */
+	if (chip->ops->fill_midi_out)
+		chip->ops->fill_midi_out(chip, out_urb->buffer);
+
+	ret = usb_submit_urb(&out_urb->instance, GFP_ATOMIC);
+	if (ret < 0)
+		goto out_fail;
+
+	return;
+
+out_fail:
+	ozzy_pcm_err(&chip->dev->dev, "PCM output URB failure\n");
+	rt->panic = true;
+}
+
+/* ========================================================================
+ * ALSA PCM Operations
+ * ======================================================================== */
+
+/*
+ * ozzy_pcm_open - ALSA PCM open callback.
+ * Builds snd_pcm_hardware dynamically from the device's info descriptor.
+ */
+static int ozzy_pcm_open(struct snd_pcm_substream *alsa_sub)
+{
+	struct pcm_runtime *rt = snd_pcm_substream_chip(alsa_sub);
+	struct ozzy_chip *chip = rt->chip;
+	const struct ozzy_device_info *info = chip->info;
+	struct pcm_substream *sub;
+	struct snd_pcm_runtime *alsa_rt = alsa_sub->runtime;
+	unsigned int alsa_frame_bytes = info->playback_channels * info->bytes_per_sample;
+	unsigned int alsa_pkt_bytes = info->frames_per_out_packet * alsa_frame_bytes;
+
+	if (rt->panic)
+		return -EPIPE;
+
+	mutex_lock(&rt->stream_mutex);
+
+	/* Build hardware descriptor from device info */
+	alsa_rt->hw.info = SNDRV_PCM_INFO_MMAP |
+			   SNDRV_PCM_INFO_INTERLEAVED |
+			   SNDRV_PCM_INFO_BLOCK_TRANSFER |
+			   SNDRV_PCM_INFO_PAUSE |
+			   SNDRV_PCM_INFO_MMAP_VALID;
+	alsa_rt->hw.formats = info->alsa_format;
+	alsa_rt->hw.rates = info->rates_mask;
+	alsa_rt->hw.rate_min = info->rate_min;
+	alsa_rt->hw.rate_max = info->rate_max;
+	alsa_rt->hw.channels_min = info->playback_channels;
+	alsa_rt->hw.channels_max = info->playback_channels;
+	alsa_rt->hw.buffer_bytes_max = 2000 * alsa_pkt_bytes;
+	alsa_rt->hw.period_bytes_min = 2 * alsa_pkt_bytes;
+	alsa_rt->hw.period_bytes_max = 2000 * alsa_pkt_bytes;
+	alsa_rt->hw.periods_min = 2;
+	alsa_rt->hw.periods_max = 1024;
+
+	if (alsa_sub->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		sub = &rt->playback;
+	else if (alsa_sub->stream == SNDRV_PCM_STREAM_CAPTURE)
+		sub = &rt->capture;
+	else {
+		mutex_unlock(&rt->stream_mutex);
+		return -EINVAL;
+	}
+
+	sub->instance = alsa_sub;
+	sub->active = false;
+	mutex_unlock(&rt->stream_mutex);
+	return 0;
+}
+
+/*
+ * ozzy_pcm_close - ALSA PCM close callback.
+ * Deactivates the substream and stops streaming if all substreams are closed.
+ */
+static int ozzy_pcm_close(struct snd_pcm_substream *alsa_sub)
+{
+	struct pcm_runtime *rt = snd_pcm_substream_chip(alsa_sub);
+	struct ozzy_chip *chip = rt->chip;
+	struct pcm_substream *sub = ozzy_pcm_get_substream(alsa_sub);
+	unsigned long flags;
+
+	if (rt->panic)
+		return 0;
+
+	mutex_lock(&rt->stream_mutex);
+	if (sub) {
+		spin_lock_irqsave(&sub->lock, flags);
+		sub->instance = NULL;
+		sub->active = false;
+		spin_unlock_irqrestore(&sub->lock, flags);
+
+		if (!rt->playback.instance && !rt->capture.instance) {
+			ozzy_pcm_stream_stop(rt);
+			rt->rate = chip->info->num_rates;
+		}
+	}
+	mutex_unlock(&rt->stream_mutex);
+	return 0;
+}
+
+/*
+ * ozzy_pcm_set_rate - Handle sample rate changes, resetting device if needed.
+ * Call with stream_mutex held.
+ */
+static int ozzy_pcm_set_rate(struct pcm_runtime *rt)
+{
+	struct ozzy_chip *chip = rt->chip;
+
+	chip->requested_rate = rt->rate;
+
+	if (chip->requested_rate != chip->current_rate) {
+		ozzy_pcm_err(&chip->dev->dev,
+			   "Resetting device for sample rate change %u -> %u\n",
+			   chip->info->rates[chip->current_rate],
+			   chip->info->rates[chip->requested_rate]);
+
+		/* Set the new rate via device ops */
+		chip->ops->set_rate(chip, chip->requested_rate);
+
+		/* Reset the device -- pre_reset/post_reset handle URB lifecycle */
+		mutex_unlock(&rt->stream_mutex);
+		chip->ops->reset(chip);
+		mutex_lock(&rt->stream_mutex);
+	}
+
+	return 0;
+}
+
+/*
+ * ozzy_pcm_prepare - ALSA PCM prepare callback.
+ * Validates format, sets sample rate, and starts the stream.
+ */
+static int ozzy_pcm_prepare(struct snd_pcm_substream *alsa_sub)
+{
+	struct pcm_runtime *rt = snd_pcm_substream_chip(alsa_sub);
+	struct ozzy_chip *chip = rt->chip;
+	struct pcm_substream *sub = ozzy_pcm_get_substream(alsa_sub);
+	struct snd_pcm_runtime *alsa_rt = alsa_sub->runtime;
+	unsigned int i;
+	int ret;
+
+	if (rt->panic)
+		return -EPIPE;
+	if (!sub)
+		return -ENODEV;
+
+	mutex_lock(&rt->stream_mutex);
+
+	if (alsa_rt->format != SNDRV_PCM_FORMAT_S24_3LE) {
+		mutex_unlock(&rt->stream_mutex);
+		return -EINVAL;
+	}
+
+	sub->dma_off = 0;
+	sub->period_off = 0;
+
+	if (rt->stream_state == STREAM_DISABLED) {
+		/* Find the rate index */
+		for (i = 0; i < chip->info->num_rates; i++) {
+			if (alsa_rt->rate == chip->info->rates[i])
+				break;
+		}
+		if (i == chip->info->num_rates) {
+			mutex_unlock(&rt->stream_mutex);
+			ozzy_pcm_err(&chip->dev->dev, "Invalid sample rate %d\n",
+				alsa_rt->rate);
+			return -EINVAL;
+		}
+
+		rt->rate = i;
+
+		ret = ozzy_pcm_set_rate(rt);
+		if (ret) {
+			mutex_unlock(&rt->stream_mutex);
+			return ret;
+		}
+
+		ret = ozzy_pcm_stream_start(rt);
+		if (ret) {
+			mutex_unlock(&rt->stream_mutex);
+			ozzy_pcm_err(&chip->dev->dev, "Could not start PCM stream\n");
+			return ret;
+		}
+	}
+
+	mutex_unlock(&rt->stream_mutex);
+	return 0;
+}
+
+/*
+ * ozzy_pcm_trigger - ALSA PCM trigger callback.
+ * Activates or deactivates the substream for URB processing.
+ */
+static int ozzy_pcm_trigger(struct snd_pcm_substream *alsa_sub, int cmd)
+{
+	struct pcm_substream *sub = ozzy_pcm_get_substream(alsa_sub);
+	struct pcm_runtime *rt = snd_pcm_substream_chip(alsa_sub);
+
+	if (rt->panic)
+		return -EPIPE;
+	if (!sub)
+		return -ENODEV;
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		spin_lock_irq(&sub->lock);
+		sub->active = true;
+		spin_unlock_irq(&sub->lock);
+		return 0;
+
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		spin_lock_irq(&sub->lock);
+		sub->active = false;
+		spin_unlock_irq(&sub->lock);
+		return 0;
+
+	default:
+		return -EINVAL;
+	}
+}
+
+/*
+ * ozzy_pcm_pointer - ALSA PCM pointer callback.
+ * Returns the current DMA position in frames.
+ */
+static snd_pcm_uframes_t ozzy_pcm_pointer(struct snd_pcm_substream *alsa_sub)
+{
+	struct pcm_substream *sub = ozzy_pcm_get_substream(alsa_sub);
+	struct pcm_runtime *rt = snd_pcm_substream_chip(alsa_sub);
+	unsigned long flags;
+	snd_pcm_uframes_t dma_offset;
+
+	if (rt->panic || !sub) {
+		ozzy_pcm_err(&rt->chip->dev->dev, "PCM XRUN\n");
+		return SNDRV_PCM_POS_XRUN;
+	}
+
+	spin_lock_irqsave(&sub->lock, flags);
+	dma_offset = sub->dma_off;
+	spin_unlock_irqrestore(&sub->lock, flags);
+
+	return bytes_to_frames(alsa_sub->runtime, dma_offset);
+}
+
+static int ozzy_pcm_hw_params(struct snd_pcm_substream *substream,
+                              struct snd_pcm_hw_params *hw_params)
+{
+    return snd_pcm_lib_malloc_pages(
+        substream,
+        params_buffer_bytes(hw_params)
+    );
+}
+
+static int ozzy_pcm_hw_free(struct snd_pcm_substream *substream)
+{
+    return snd_pcm_lib_free_pages(substream);
+}
+
+static const struct snd_pcm_ops ozzy_pcm_ops = {
+    .open      = ozzy_pcm_open,
+    .close     = ozzy_pcm_close,
+    .hw_params = ozzy_pcm_hw_params,
+    .hw_free   = ozzy_pcm_hw_free,
+    .prepare   = ozzy_pcm_prepare,
+    .trigger   = ozzy_pcm_trigger,
+    .pointer   = ozzy_pcm_pointer,
+};
+
+/* ========================================================================
+ * URB Initialization
+ * ======================================================================== */
+
+/*
+ * ozzy_pcm_init_out_urb - Initialize a single output URB.
+ * Detects bulk vs interrupt and fills the appropriate USB pipe.
+ */
+static int ozzy_pcm_init_out_urb(struct pcm_urb *urb, struct ozzy_chip *chip)
+{
+	const struct ozzy_device_info *info = chip->info;
+	unsigned int pkt_size;
+
+	urb->chip = chip;
+	usb_init_urb(&urb->instance);
+
+	/* Get packet size (may differ for bulk vs interrupt) */
+	if (chip->ops->get_out_packet_size)
+		pkt_size = chip->ops->get_out_packet_size(chip, chip->is_bulk);
+	else
+		pkt_size = info->out_packet_size;
+
+	urb->buffer = kzalloc(pkt_size, GFP_KERNEL);
+	if (!urb->buffer)
+		return -ENOMEM;
+
+	/* Fill initial silence pattern */
+	if (chip->ops->init_out_urb)
+		chip->ops->init_out_urb(chip, urb->buffer);
+
+	if (chip->is_bulk) {
+		usb_fill_bulk_urb(&urb->instance, chip->dev,
+				  usb_sndbulkpipe(chip->dev, info->out_ep),
+				  urb->buffer, pkt_size,
+				  ozzy_pcm_out_urb_handler, urb);
+	} else {
+		usb_fill_int_urb(&urb->instance, chip->dev,
+				 usb_sndintpipe(chip->dev, info->out_ep),
+				 urb->buffer, pkt_size,
+				 ozzy_pcm_out_urb_handler, urb,
+				 chip->dev->ep_out[info->out_ep]->desc.bInterval);
+	}
+
+	if (usb_urb_ep_type_check(&urb->instance)) {
+		ozzy_pcm_err(&chip->dev->dev, "Output URB endpoint sanity check failed\n");
+		return -EINVAL;
+	}
+
+	init_usb_anchor(&urb->submitted);
+	return 0;
+}
+
+/*
+ * ozzy_pcm_init_in_urb - Initialize a single input URB.
+ * Detects bulk vs interrupt and fills the appropriate USB pipe.
+ */
+static int ozzy_pcm_init_in_urb(struct pcm_urb *urb, struct ozzy_chip *chip)
+{
+	const struct ozzy_device_info *info = chip->info;
+
+	urb->chip = chip;
+	usb_init_urb(&urb->instance);
+
+	urb->buffer = kzalloc(info->in_packet_size, GFP_KERNEL);
+	if (!urb->buffer)
+		return -ENOMEM;
+
+	if ((chip->dev->ep_in[info->in_ep]->desc.bmAttributes &
+	     USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_BULK) {
+		usb_fill_bulk_urb(&urb->instance, chip->dev,
+				  usb_rcvbulkpipe(chip->dev, info->in_ep),
+				  urb->buffer, info->in_packet_size,
+				  ozzy_pcm_in_urb_handler, urb);
+	} else {
+		usb_fill_int_urb(&urb->instance, chip->dev,
+				 usb_rcvintpipe(chip->dev, info->in_ep),
+				 urb->buffer, info->in_packet_size,
+				 ozzy_pcm_in_urb_handler, urb,
+				 chip->dev->ep_in[info->in_ep]->desc.bInterval);
+	}
+
+	if (usb_urb_ep_type_check(&urb->instance)) {
+		ozzy_pcm_err(&chip->dev->dev, "Input URB endpoint sanity check failed\n");
+		return -EINVAL;
+	}
+
+	init_usb_anchor(&urb->submitted);
+	return 0;
+}
+
+/*
+ * ozzy_pcm_init_urbs - Initialize and submit all PCM URBs.
+ * Called during initial probe and after USB device reset (post_reset).
+ */
+int ozzy_pcm_init_urbs(struct ozzy_chip *chip)
+{
+	struct pcm_runtime *rt = chip->pcm;
+	uint8_t i;
+	int ret;
+
+	rt->chip = chip;
+
+	/* Initialize input URBs */
+	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
+		ret = ozzy_pcm_init_in_urb(&rt->pcm_in_urbs[i], chip);
+		if (ret < 0)
+			goto error;
+	}
+
+	/* Initialize output URBs */
+	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
+		ret = ozzy_pcm_init_out_urb(&rt->pcm_out_urbs[i], chip);
+		if (ret < 0)
+			goto error;
+	}
+
+	/* Submit all URBs */
+	mutex_lock(&rt->stream_mutex);
+	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
+		usb_anchor_urb(&rt->pcm_in_urbs[i].instance,
+			       &rt->pcm_in_urbs[i].submitted);
+		ret = usb_submit_urb(&rt->pcm_in_urbs[i].instance, GFP_ATOMIC);
+		if (ret < 0) {
+			ozzy_pcm_stream_stop(rt);
+			ozzy_pcm_kill_urbs(rt);
+			goto error_locked;
+		}
+	}
+
+	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
+		usb_anchor_urb(&rt->pcm_out_urbs[i].instance,
+			       &rt->pcm_out_urbs[i].submitted);
+		ret = usb_submit_urb(&rt->pcm_out_urbs[i].instance, GFP_ATOMIC);
+		if (ret < 0) {
+			ozzy_pcm_stream_stop(rt);
+			ozzy_pcm_kill_urbs(rt);
+			goto error_locked;
+		}
+	}
+	mutex_unlock(&rt->stream_mutex);
+
+	return 0;
+
+error_locked:
+	mutex_unlock(&rt->stream_mutex);
+error:
+	ozzy_pcm_err(&chip->dev->dev, "PCM URB initialization failed\n");
+	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
+		kfree(rt->pcm_out_urbs[i].buffer);
+		kfree(rt->pcm_in_urbs[i].buffer);
+	}
+	return ret;
+}
+
+/* ========================================================================
+ * Init / Abort
+ * ======================================================================== */
+
+/*
+ * ozzy_pcm_abort - Emergency stop all PCM activity.
+ * Sets panic flag and poisons all URBs to prevent resubmission.
+ */
+void ozzy_pcm_abort(struct ozzy_chip *chip)
+{
+	struct pcm_runtime *rt = chip->pcm;
+
+	if (rt) {
+		rt->panic = true;
+		ozzy_pcm_stream_stop(rt);
+		ozzy_pcm_poison_urbs(rt);
+	}
+}
+
+/*
+ * ozzy_pcm_init - Create and initialize the PCM subsystem.
+ * Allocates the runtime, registers ALSA PCM, and sets up URBs.
+ */
+int ozzy_pcm_init(struct ozzy_chip *chip)
+{
+	struct snd_pcm *pcm;
+	struct pcm_runtime *rt;
+	int ret;
+
+	rt = kzalloc(sizeof(struct pcm_runtime), GFP_KERNEL);
+	if (!rt)
+		return -ENOMEM;
+
+	rt->chip = chip;
+	rt->stream_state = STREAM_DISABLED;
+
+	mutex_init(&rt->stream_mutex);
+	spin_lock_init(&rt->playback.lock);
+	spin_lock_init(&rt->capture.lock);
+
+	ret = snd_pcm_new(chip->card, chip->dev->product, 0, 1, 1, &pcm);
+	if (ret < 0) {
+		kfree(rt);
+		ozzy_pcm_err(&chip->dev->dev, "Cannot create PCM instance\n");
+		return ret;
+	}
+
+	pcm->private_data = rt;
+
+	strscpy(pcm->name, chip->dev->product, sizeof(pcm->name));
+	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &ozzy_pcm_ops);
+	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &ozzy_pcm_ops);
+
+	snd_pcm_lib_preallocate_pages_for_all(
+	    pcm,
+	    SNDRV_DMA_TYPE_CONTINUOUS,
+	    snd_dma_continuous_data(GFP_KERNEL),
+	    64 * 1024,
+	    1024 * 1024
+	);
+
+	rt->instance = pcm;
+	chip->pcm = rt;
+
+	ret = ozzy_pcm_init_urbs(chip);
+	if (ret < 0) {
+		ozzy_pcm_err(&chip->dev->dev, "PCM URB setup failed\n");
+		kfree(rt);
+		return ret;
+	}
+
+	return 0;
+}
