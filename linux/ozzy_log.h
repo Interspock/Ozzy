@@ -12,7 +12,7 @@
 #ifndef OZZY_LOG_H
 #define OZZY_LOG_H
 
-#include <linux/dev_printk.h>
+#include <linux/device.h>
 
 /* Core driver logging (probe, disconnect, reset) */
 #define ozzy_log(dev, fmt, ...)     dev_info(dev, "[ozzy] " fmt, ##__VA_ARGS__)

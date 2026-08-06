@@ -252,7 +252,16 @@ static int ozzy_pcm_open(struct snd_pcm_substream *alsa_sub)
 	const struct ozzy_device_info *info = chip->info;
 	struct pcm_substream *sub;
 	struct snd_pcm_runtime *alsa_rt = alsa_sub->runtime;
-	unsigned int alsa_frame_bytes = info->playback_channels * info->bytes_per_sample;
+	unsigned int channels;
+
+	if (alsa_sub->stream == SNDRV_PCM_STREAM_PLAYBACK)
+	    channels = info->playback_channels;
+	else
+	    channels = info->capture_channels;
+
+	unsigned int alsa_frame_bytes =
+	    channels * info->bytes_per_sample;
+
 	unsigned int alsa_pkt_bytes = info->frames_per_out_packet * alsa_frame_bytes;
 
 	if (rt->panic)
@@ -270,8 +279,8 @@ static int ozzy_pcm_open(struct snd_pcm_substream *alsa_sub)
 	alsa_rt->hw.rates = info->rates_mask;
 	alsa_rt->hw.rate_min = info->rate_min;
 	alsa_rt->hw.rate_max = info->rate_max;
-	alsa_rt->hw.channels_min = info->playback_channels;
-	alsa_rt->hw.channels_max = info->playback_channels;
+	alsa_rt->hw.channels_min = channels;
+	alsa_rt->hw.channels_max = channels;
 	alsa_rt->hw.buffer_bytes_max = 2000 * alsa_pkt_bytes;
 	alsa_rt->hw.period_bytes_min = 2 * alsa_pkt_bytes;
 	alsa_rt->hw.period_bytes_max = 2000 * alsa_pkt_bytes;
@@ -469,12 +478,29 @@ static snd_pcm_uframes_t ozzy_pcm_pointer(struct snd_pcm_substream *alsa_sub)
 	return bytes_to_frames(alsa_sub->runtime, dma_offset);
 }
 
+static int ozzy_pcm_hw_params(struct snd_pcm_substream *substream,
+                              struct snd_pcm_hw_params *hw_params)
+{
+    return snd_pcm_lib_malloc_pages(
+        substream,
+        params_buffer_bytes(hw_params)
+    );
+}
+
+static int ozzy_pcm_hw_free(struct snd_pcm_substream *substream)
+{
+    return snd_pcm_lib_free_pages(substream);
+}
+
 static const struct snd_pcm_ops ozzy_pcm_ops = {
-	.open    = ozzy_pcm_open,
-	.close   = ozzy_pcm_close,
-	.prepare = ozzy_pcm_prepare,
-	.trigger = ozzy_pcm_trigger,
-	.pointer = ozzy_pcm_pointer,
+    .open      = ozzy_pcm_open,
+    .close     = ozzy_pcm_close,
+    .hw_params = ozzy_pcm_hw_params,
+    .hw_free   = ozzy_pcm_hw_free,
+    .prepare   = ozzy_pcm_prepare,
+    .trigger   = ozzy_pcm_trigger,
+    .pointer   = ozzy_pcm_pointer,
+    .ioctl     = snd_pcm_lib_ioctl,    
 };
 
 /* ========================================================================
@@ -671,7 +697,15 @@ int ozzy_pcm_init(struct ozzy_chip *chip)
 	spin_lock_init(&rt->playback.lock);
 	spin_lock_init(&rt->capture.lock);
 
-	ret = snd_pcm_new(chip->card, chip->dev->product, 0, 1, 1, &pcm);
+	ret = snd_pcm_new(
+	    chip->card,
+	    chip->dev->product,
+	    0,
+	    chip->info->playback_channels ? 1 : 0,
+	    chip->info->capture_channels ? 1 : 0,
+	    &pcm
+	);
+
 	if (ret < 0) {
 		kfree(rt);
 		ozzy_pcm_err(&chip->dev->dev, "Cannot create PCM instance\n");
@@ -681,9 +715,27 @@ int ozzy_pcm_init(struct ozzy_chip *chip)
 	pcm->private_data = rt;
 
 	strscpy(pcm->name, chip->dev->product, sizeof(pcm->name));
-	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &ozzy_pcm_ops);
-	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &ozzy_pcm_ops);
-	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
+	if (chip->info->playback_channels)
+	    snd_pcm_set_ops(
+	        pcm,
+	        SNDRV_PCM_STREAM_PLAYBACK,
+	        &ozzy_pcm_ops
+	    );
+
+	if (chip->info->capture_channels)
+	    snd_pcm_set_ops(
+	        pcm,
+	        SNDRV_PCM_STREAM_CAPTURE,
+	        &ozzy_pcm_ops
+	    );
+
+	snd_pcm_lib_preallocate_pages_for_all(
+	    pcm,
+	    SNDRV_DMA_TYPE_CONTINUOUS,
+	    snd_dma_continuous_data(GFP_KERNEL),
+	    64 * 1024,
+	    1024 * 1024
+	);
 
 	rt->instance = pcm;
 	chip->pcm = rt;

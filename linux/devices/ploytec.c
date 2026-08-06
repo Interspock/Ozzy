@@ -510,6 +510,95 @@ static unsigned int ploytec_get_out_packet_size(struct ozzy_chip *chip, bool is_
  * Exported Device Descriptor and Operations
  * ======================================================================== */
 
+#define AUDIOLINK_CHANNELS          4
+#define AUDIOLINK_IN_PACKET_SIZE    512
+#define AUDIOLINK_OUT_PACKET_SIZE   512
+#define AUDIOLINK_IN_FRAME_SIZE     64
+#define AUDIOLINK_FRAMES_PER_PACKET 8
+#define AUDIOLINK_ALSA_FRAME_SIZE   (AUDIOLINK_CHANNELS * 3)
+#define AUDIOLINK_ALSA_PACKET_SIZE  \
+    (AUDIOLINK_FRAMES_PER_PACKET * AUDIOLINK_ALSA_FRAME_SIZE)
+
+static unsigned int audiolink_process_in_packet(
+    struct ozzy_chip *chip,
+    uint8_t *urb_buf,
+    uint8_t *dma_area,
+    unsigned int dma_off,
+    unsigned int pcm_buffer_size)
+{
+    unsigned int f;
+    unsigned int dst_off;
+    uint8_t decoded[24];
+
+    for (f = 0; f < AUDIOLINK_FRAMES_PER_PACKET; f++) {
+
+        /*
+         * Decoder Ploytec existente:
+         * 64 bytes device -> 8 x 24-bit PCM.
+         *
+         * En AudioLink sólo usamos CH1..CH4,
+         * es decir los primeros 12 bytes.
+         */
+        ploytec_decode_frame(
+            decoded,
+            urb_buf + f * AUDIOLINK_IN_FRAME_SIZE
+        );
+
+        dst_off =
+            dma_off + f * AUDIOLINK_ALSA_FRAME_SIZE;
+
+        if (dst_off >= pcm_buffer_size)
+            dst_off -= pcm_buffer_size;
+
+        if (dst_off + AUDIOLINK_ALSA_FRAME_SIZE
+            <= pcm_buffer_size) {
+
+            memcpy(
+                dma_area + dst_off,
+                decoded,
+                AUDIOLINK_ALSA_FRAME_SIZE
+            );
+
+        } else {
+
+            unsigned int first =
+                pcm_buffer_size - dst_off;
+
+            memcpy(
+                dma_area + dst_off,
+                decoded,
+                first
+            );
+
+            memcpy(
+                dma_area,
+                decoded + first,
+                AUDIOLINK_ALSA_FRAME_SIZE - first
+            );
+        }
+    }
+
+    return AUDIOLINK_ALSA_PACKET_SIZE;
+}
+
+static void audiolink_init_out_urb(
+    struct ozzy_chip *chip,
+    uint8_t *buffer)
+{
+    /*
+     * Esto reproduce exactamente el probe que funcionó:
+     * 512 bytes de cero sostenidos sobre EP 0x05.
+     */
+    memset(buffer, 0, AUDIOLINK_OUT_PACKET_SIZE);
+}
+
+static unsigned int audiolink_get_out_packet_size(
+    struct ozzy_chip *chip,
+    bool is_bulk)
+{
+    return AUDIOLINK_OUT_PACKET_SIZE;
+}
+
 const struct ozzy_device_info ploytec_info = {
 	.name                  = "Ploytec Xone",
 	.playback_channels     = PLOYTEC_CHANNELS,
@@ -543,4 +632,72 @@ const struct ozzy_device_ops ploytec_ops = {
 	.init_out_urb        = ploytec_init_out_urb,
 	.fill_midi_out       = ploytec_fill_midi_out,
 	.get_out_packet_size = ploytec_get_out_packet_size,
+};
+
+const struct ozzy_device_info audiolink_info = {
+    .name                  = "MIDIPLUS AudioLink Plus II",
+
+    /*
+     * De momento dejamos playback en 0:
+     * queremos validar captura antes de tocar el encoder OUT.
+     */
+    .playback_channels     = 0,
+    .capture_channels      = 4,
+
+    .out_packet_size       = AUDIOLINK_OUT_PACKET_SIZE,
+    .in_packet_size        = AUDIOLINK_IN_PACKET_SIZE,
+
+    .frames_per_out_packet = 8,
+    .frames_per_in_packet  = 8,
+
+    .out_ep                = 0x05,
+    .in_ep                 = 0x06,
+
+    .alsa_format           = SNDRV_PCM_FMTBIT_S24_3LE,
+    .bytes_per_sample      = 3,
+
+    /*
+     * MIDI lo dejamos apagado inicialmente.
+     */
+    .midi_in_ep            = 0,
+    .midi_out_embedded     = false,
+
+    .num_interfaces        = 2,
+    .alt_setting           = 1,
+
+    .rates                 = ploytec_rates,
+    .num_rates             = ARRAY_SIZE(ploytec_rates),
+
+    .rates_mask            =
+        SNDRV_PCM_RATE_44100 |
+        SNDRV_PCM_RATE_48000 |
+        SNDRV_PCM_RATE_88200 |
+        SNDRV_PCM_RATE_96000,
+
+    .rate_min              = 44100,
+    .rate_max              = 96000,
+};
+
+const struct ozzy_device_ops audiolink_ops = {
+    /*
+     * Todo el handshake Ploytec ya está confirmado
+     * físicamente en nuestra placa.
+     */
+    .init                = ploytec_init,
+    .free                = ploytec_free,
+    .set_rate            = ploytec_set_rate,
+    .reset               = ploytec_reset,
+
+    /*
+     * Playback todavía no.
+     */
+    .process_out_packet  = NULL,
+
+    .process_in_packet   = audiolink_process_in_packet,
+
+    .init_out_urb        = audiolink_init_out_urb,
+
+    .fill_midi_out       = NULL,
+
+    .get_out_packet_size = audiolink_get_out_packet_size,
 };
