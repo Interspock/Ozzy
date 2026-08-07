@@ -23,6 +23,10 @@ build/
 Module.symvers
 modules.order
 
+# Local AudioLink MIDI test binaries
+MIDI/audiolink-midi-loop
+MIDI/audiolink-midi-sniff
+
 # Xcode
 xcuserdata/
 *.xcworkspace/xcuserdata/
