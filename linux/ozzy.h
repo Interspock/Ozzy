@@ -146,6 +146,15 @@ struct ozzy_device_ops {
 	void (*fill_midi_out)(struct ozzy_chip *chip, uint8_t *urb_buf);
 
 	/*
+	 * process_midi_in_packet - Deframe a device-specific MIDI input packet.
+	 * May compact the packet in-place. Returns the number of raw MIDI bytes
+	 * to forward to ALSA. NULL means the USB payload is already raw MIDI.
+	 */
+	unsigned int (*process_midi_in_packet)(struct ozzy_chip *chip,
+					       uint8_t *buffer,
+					       unsigned int length);
+
+	/*
 	 * get_out_packet_size - Return the output packet size in bytes.
 	 * May differ between bulk and interrupt transfer modes.
 	 * Called during URB allocation to determine buffer size.

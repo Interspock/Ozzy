@@ -56,6 +56,7 @@ static void ozzy_midi_in_urb_handler(struct urb *usb_urb)
 	struct midi_urb *in_urb = usb_urb->context;
 	struct midi_runtime *rt = in_urb->chip->midi;
 	unsigned long flags;
+	unsigned int midi_len;
 	int ret;
 
 	if (unlikely(usb_urb->status == -ENOENT ||
@@ -64,10 +65,14 @@ static void ozzy_midi_in_urb_handler(struct urb *usb_urb)
 		     usb_urb->status == -ESHUTDOWN))
 		goto in_fail;
 
+	midi_len = in_urb->instance.actual_length;
+	if (in_urb->chip->ops->process_midi_in_packet)
+		midi_len = in_urb->chip->ops->process_midi_in_packet(
+			in_urb->chip, in_urb->buffer, midi_len);
+
 	spin_lock_irqsave(&rt->in_lock, flags);
-	if (rt->in)
-		snd_rawmidi_receive(rt->in, in_urb->buffer,
-				    in_urb->instance.actual_length);
+	if (rt->in && midi_len)
+		snd_rawmidi_receive(rt->in, in_urb->buffer, midi_len);
 	spin_unlock_irqrestore(&rt->in_lock, flags);
 
 	ret = usb_submit_urb(&in_urb->instance, GFP_ATOMIC);
@@ -301,7 +306,9 @@ int ozzy_midi_init(struct ozzy_chip *chip)
 	spin_lock_init(&rt->in_lock);
 	spin_lock_init(&rt->out_lock);
 
-	ret = snd_rawmidi_new(chip->card, chip->dev->product, 0, 1, 1, &midi);
+	ret = snd_rawmidi_new(chip->card, chip->dev->product, 0,
+			      chip->info->midi_out_embedded ? 1 : 0,
+			      chip->info->midi_in_ep ? 1 : 0, &midi);
 	if (ret < 0) {
 		ozzy_midi_err(&chip->dev->dev, "Cannot create MIDI instance\n");
 		kfree(rt->send_buffer);
@@ -313,11 +320,19 @@ int ozzy_midi_init(struct ozzy_chip *chip)
 	midi->private_data = rt;
 
 	strscpy(midi->name, chip->dev->product, sizeof(midi->name));
-	midi->info_flags = SNDRV_RAWMIDI_INFO_OUTPUT |
-			   SNDRV_RAWMIDI_INFO_INPUT |
-			   SNDRV_RAWMIDI_INFO_DUPLEX;
-	snd_rawmidi_set_ops(midi, SNDRV_RAWMIDI_STREAM_OUTPUT, &ozzy_midi_out_ops);
-	snd_rawmidi_set_ops(midi, SNDRV_RAWMIDI_STREAM_INPUT, &ozzy_midi_in_ops);
+	midi->info_flags = 0;
+	if (chip->info->midi_in_ep) {
+		midi->info_flags |= SNDRV_RAWMIDI_INFO_INPUT;
+		snd_rawmidi_set_ops(midi, SNDRV_RAWMIDI_STREAM_INPUT,
+				   &ozzy_midi_in_ops);
+	}
+	if (chip->info->midi_out_embedded) {
+		midi->info_flags |= SNDRV_RAWMIDI_INFO_OUTPUT;
+		snd_rawmidi_set_ops(midi, SNDRV_RAWMIDI_STREAM_OUTPUT,
+				   &ozzy_midi_out_ops);
+	}
+	if (chip->info->midi_in_ep && chip->info->midi_out_embedded)
+		midi->info_flags |= SNDRV_RAWMIDI_INFO_DUPLEX;
 
 	rt->instance = midi;
 	chip->midi = rt;

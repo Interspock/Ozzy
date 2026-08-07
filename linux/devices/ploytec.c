@@ -684,6 +684,48 @@ static unsigned int audiolink_get_out_packet_size(
 }
 
 
+
+/*
+ * AudioLink MIDI IN framing: each USB transfer is composed of 5-byte records.
+ * The first four bytes are MIDI slots where 0xFD means idle; byte 4 is a
+ * fixed 0xEB framing byte. Compact valid MIDI bytes in-place and preserve
+ * running status exactly as sent by the hardware.
+ */
+static unsigned int audiolink_process_midi_in_packet(
+    struct ozzy_chip *chip, uint8_t *buffer, unsigned int length)
+{
+    unsigned int base, slot, out = 0;
+
+    (void)chip;
+
+    for (base = 0; base + 5 <= length; base += 5) {
+        for (slot = 0; slot < 4; slot++) {
+            uint8_t byte = buffer[base + slot];
+
+            if (byte != PLOYTEC_MIDI_IDLE_BYTE)
+                buffer[out++] = byte;
+        }
+    }
+
+    return out;
+}
+
+/*
+ * AudioLink MIDI OUT framing: one MIDI byte is embedded at offset 480 of
+ * each 512-byte EP05 bulk packet. Offset 481 is the fixed 0xFF sync byte.
+ * This layout was confirmed with a physical MIDI OUT -> MIDI IN loopback.
+ */
+static void audiolink_fill_midi_out(struct ozzy_chip *chip, uint8_t *urb_buf)
+{
+    struct midi_runtime *rt = chip->midi;
+
+    if (!rt)
+        return;
+
+    ozzy_midi_consume(rt, urb_buf + 480, 1, PLOYTEC_MIDI_IDLE_BYTE);
+    urb_buf[481] = 0xFF;
+}
+
 const struct ozzy_device_info ploytec_info = {
 	.name                  = "Ploytec Xone",
 	.playback_channels     = PLOYTEC_CHANNELS,
@@ -716,16 +758,13 @@ const struct ozzy_device_ops ploytec_ops = {
 	.process_in_packet   = ploytec_process_in_packet,
 	.init_out_urb        = ploytec_init_out_urb,
 	.fill_midi_out       = ploytec_fill_midi_out,
+	.process_midi_in_packet = NULL,
 	.get_out_packet_size = ploytec_get_out_packet_size,
 };
 
 const struct ozzy_device_info audiolink_info = {
     .name                  = "MIDIPLUS AudioLink Plus II",
 
-    /*
-     * De momento dejamos playback en 0:
-     * queremos validar captura antes de tocar el encoder OUT.
-     */
     .playback_channels     = 4,
     .capture_channels      = 4,
 
@@ -741,11 +780,8 @@ const struct ozzy_device_info audiolink_info = {
     .alsa_format           = SNDRV_PCM_FMTBIT_S24_3LE,
     .bytes_per_sample      = 3,
 
-    /*
-     * MIDI lo dejamos apagado inicialmente.
-     */
-    .midi_in_ep            = 0,
-    .midi_out_embedded     = false,
+    .midi_in_ep            = 0x03,
+    .midi_out_embedded     = true,
 
     .num_interfaces        = 2,
     .alt_setting           = 1,
@@ -773,16 +809,14 @@ const struct ozzy_device_ops audiolink_ops = {
     .set_rate            = ploytec_set_rate,
     .reset               = ploytec_reset,
 
-    /*
-     * Playback todavía no.
-     */
     .process_out_packet  = audiolink_process_out_packet,
 
     .process_in_packet   = audiolink_process_in_packet,
 
     .init_out_urb        = audiolink_init_out_urb,
 
-    .fill_midi_out       = NULL,
+    .fill_midi_out       = audiolink_fill_midi_out,
+    .process_midi_in_packet = audiolink_process_midi_in_packet,
 
     .get_out_packet_size = audiolink_get_out_packet_size,
 };
