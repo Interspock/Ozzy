@@ -10,7 +10,7 @@ This is an open-source, reverse-engineered driver supporting non-class compliant
 
 **Currently Supported Devices:**
 * **Allen & Heath Xone:DB4, DB2, DX, 4D** (Ploytec-based protocol)
-* **MIDIPLUS AudioLink Plus II / AudioLink Plus 4x4** (`1acc:0103`, Ploytec OEM protocol) — Linux 4-channel capture and playback validated
+* **MIDIPLUS AudioLink Plus II / AudioLink Plus 4x4** (`1acc:0103`, Ploytec OEM protocol) — Linux 4×4 audio plus MIDI IN/OUT validated on real hardware
 
 More devices can be added—the architecture separates the audio engine from device protocols.
 
@@ -39,7 +39,7 @@ Ozzy reverses the protocol and provides modern drivers—so your equipment keeps
 | **Allen & Heath Xone:DB2** | 8×8 | 44.1/48/88.2/96 kHz | ✅ Perfect |
 | **Allen & Heath Xone:DX** | 8×8 | 44.1/48/88.2/96 kHz | ✅ Perfect |
 | **Allen & Heath Xone:4D** | 8×8 | 44.1/48/88.2/96 kHz | ✅ Perfect |
-| **MIDIPLUS AudioLink Plus II / 4x4** | 4 in / 4 out | 44.1/48/88.2/96 kHz | ✅ Linux capture and playback validated |
+| **MIDIPLUS AudioLink Plus II / 4x4** | 4 in / 4 out + MIDI I/O | 44.1/48/88.2/96 kHz | ✅ Linux audio + MIDI fully validated |
 
 ### MIDIPLUS AudioLink Plus II status
 
@@ -53,9 +53,11 @@ Validated on real hardware:
 * **Dynamic sample-rate switching:** validated repeatedly across USB resets and full vendor re-handshakes
 * **USB transport:** vendor-specific Ploytec-style bulk streaming (`EP 0x86` capture / `EP 0x05` playback)
 * **Playback framing:** 10 sample instants × 48 wire bytes, MSB-first bit-plane packing, followed by the Ploytec bulk trailer
-* **MIDI:** not yet enabled for the AudioLink profile
+* **MIDI IN:** validated through ALSA rawmidi with notes, chords, running status, Program Change and Pitch Bend
+* **MIDI OUT:** validated through a physical DIN OUT-to-IN loopback; MIDI bytes are embedded at offset 480 of the `EP 0x05` playback packet
+* **Coexistence:** audio playback and MIDI input validated simultaneously
 
-The AudioLink is not USB Audio Class compliant. The Linux driver performs the Ploytec vendor handshake, sample-rate control and device-specific bit-interleaved PCM encoding/decoding directly.
+The AudioLink is not USB Audio Class compliant. The Linux driver performs the Ploytec vendor handshake, sample-rate control, device-specific bit-interleaved PCM encoding/decoding, MIDI input deframing and embedded MIDI output directly.
 
 Detailed protocol notes and validation results are in [`docs/MIDIPLUS-AudioLink-Plus-II.md`](docs/MIDIPLUS-AudioLink-Plus-II.md).
 
@@ -94,7 +96,7 @@ All backends share the same CoreAudio HAL and CoreMIDI drivers—only the USB co
 ### 🐧 Linux (ALSA Kernel Module)
 Standard ALSA kernel module with automatic transfer mode detection.
 * **Audio:** device-specific PCM channel counts; Xone devices use 8×8, MIDIPLUS AudioLink uses validated 4-channel capture and 4-channel playback
-* **MIDI:** ALSA Sequencer In/Out where enabled by the device profile; AudioLink MIDI is not yet enabled
+* **MIDI:** ALSA rawmidi I/O where enabled by the device profile; MIDIPLUS AudioLink MIDI IN and OUT are both validated
 * **Modes:** Automatic BULK/INTERRUPT transfer detection for existing Ploytec profiles; AudioLink uses its validated bulk endpoint topology
 * **Integration:** ALSA-native; usable from JACK, PulseAudio and PipeWire
 * **Location:** [`linux/`](linux/)
@@ -171,6 +173,15 @@ arecord -D hw:1,0 -c 4 -r 44100 -f S24_3LE -d 10 capture.wav
 
 # Playback: four channels at 44.1 kHz
 aplay -D hw:1,0 -c 4 -r 44100 -f S24_3LE playback.wav
+
+# List MIDI ports
+amidi -l
+
+# Monitor MIDI IN
+amidi -d -p hw:1,0,0
+
+# Send middle C Note On through MIDI OUT
+amidi -p hw:1,0,0 -S "90 3C 40"
 ```
 
 ---
@@ -373,8 +384,11 @@ Whether you need to support your own legacy hardware or understand how professio
 - Verify USB ID: `lsusb | grep 1acc:0103`
 - Verify capture device: `arecord -l`
 - Verify playback device: `aplay -l`
+- Verify MIDI raw ports: `amidi -l`
 - Capture test: `arecord -D hw:1,0 -f S24_3LE -c 4 -r 44100 -d 10 test.wav`
 - Playback test: `aplay -D hw:1,0 -f S24_3LE -c 4 -r 44100 test-4ch.wav`
+- MIDI IN test: `amidi -d -p hw:1,0,0`
+- MIDI OUT test: `amidi -p hw:1,0,0 -S "90 3C 40"`
 - If PulseAudio owns the device, prefix playback tests with `pasuspender --`
 
 **Reporting Issues:**
