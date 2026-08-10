@@ -43,6 +43,8 @@ struct ploytec_private {
 	unsigned char firmware_ver[15]; /* raw firmware version response */
 	unsigned char status[1];        /* hardware status byte */
 	unsigned char xfer_buf[16];     /* reusable DMA-safe buffer for vendor requests */
+	spinlock_t audiolink_midi_tx_lock;
+	unsigned int audiolink_midi_tx_phase;
 };
 
 /* Supported sample rates */
@@ -201,6 +203,8 @@ static int ploytec_init(struct ozzy_chip *chip)
             return -ENOMEM;
 
         chip->private_data = priv;
+        spin_lock_init(&priv->audiolink_midi_tx_lock);
+        priv->audiolink_midi_tx_phase = 0;
     } else {
         memset(priv->firmware_ver, 0, sizeof(priv->firmware_ver));
         memset(priv->status, 0, sizeof(priv->status));
@@ -717,14 +721,57 @@ static unsigned int audiolink_process_midi_in_packet(
  */
 static void audiolink_fill_midi_out(struct ozzy_chip *chip, uint8_t *urb_buf)
 {
+    struct ploytec_private *priv = chip->private_data;
     struct midi_runtime *rt = chip->midi;
+    unsigned int rate;
+    unsigned int divisor;
+    unsigned long flags;
 
-    if (!rt)
+    if (!rt || !priv)
         return;
 
-    ozzy_midi_consume(rt, urb_buf + 480, 1, PLOYTEC_MIDI_IDLE_BYTE);
+    /*
+     * Each EP05 packet carries 10 audio sample instants.
+     *
+     * DIN MIDI runs at 31250 bits/s, approximately 3125 bytes/s.
+     * Sending one MIDI byte in every USB audio packet would exceed
+     * the physical MIDI UART rate.
+     */
+    rate = chip->info->rates[chip->current_rate];
+
+    /*
+     * Packet rate = sample_rate / 10.
+     * We therefore need:
+     *
+     *   packet_rate / divisor <= 3125 bytes/s
+     *
+     * which simplifies to:
+     *
+     *   divisor >= sample_rate / 31250
+     */
+    divisor = DIV_ROUND_UP(rate, 31250U);
+
+    if (divisor < 1)
+        divisor = 1;
+
+    spin_lock_irqsave(&priv->audiolink_midi_tx_lock, flags);
+
+    if (priv->audiolink_midi_tx_phase == 0)
+        ozzy_midi_consume(rt, urb_buf + 480, 1,
+                          PLOYTEC_MIDI_IDLE_BYTE);
+    else
+        urb_buf[480] = PLOYTEC_MIDI_IDLE_BYTE;
+
+    priv->audiolink_midi_tx_phase++;
+
+    if (priv->audiolink_midi_tx_phase >= divisor)
+        priv->audiolink_midi_tx_phase = 0;
+
+    spin_unlock_irqrestore(&priv->audiolink_midi_tx_lock, flags);
+
     urb_buf[481] = 0xFF;
 }
+
 
 const struct ozzy_device_info ploytec_info = {
 	.name                  = "Ploytec Xone",

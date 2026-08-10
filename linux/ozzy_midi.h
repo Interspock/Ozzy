@@ -46,7 +46,6 @@ struct midi_runtime {
 
 	/* MIDI output send buffer (replaces old globals) */
 	u8 *send_buffer;                    /* pending MIDI bytes to embed in PCM out */
-	u8 *out_buffer;                     /* temp buffer for snd_rawmidi_transmit */
 	uint16_t send_count;                /* read position in send_buffer */
 	uint16_t send_pending;              /* number of bytes waiting to be sent */
 };

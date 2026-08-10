@@ -122,6 +122,16 @@ ALSA rawmidi
 
 A repeated `90 3C 40 90 3C 00` sequence was recovered byte-for-byte through the physical loop.
 
+### Long SysEx transport and output pacing
+
+Long MIDI streams require three additional guarantees in the Linux output path:
+
+- ALSA rawmidi must be refilled as the driver's staging buffer is consumed rather than draining only one fixed 64-byte chunk.
+- The staging-buffer read position and pending-byte count must be serialized because four PCM OUT URBs may complete concurrently.
+- Embedded MIDI bytes must be paced below the physical 31.25 kbit/s DIN MIDI rate. Sending one byte in every AudioLink EP05 audio packet overruns the hardware MIDI UART.
+
+These behaviors were isolated with physical MIDI OUT-to-IN loopback tests. The original implementation corrupted or truncated longer streams; the corrected implementation recovered 80, 512, 1024 and 4096-byte SysEx test messages byte-for-byte, including the initial `F0` and terminating `F7`. All final comparisons returned `cmp = 0`.
+
 ## ALSA examples
 
 Capture four channels at 44.1 kHz:

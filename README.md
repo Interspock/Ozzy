@@ -55,6 +55,8 @@ Validated on real hardware:
 * **Playback framing:** 10 sample instants × 48 wire bytes, MSB-first bit-plane packing, followed by the Ploytec bulk trailer
 * **MIDI IN:** validated through ALSA rawmidi with notes, chords, running status, Program Change and Pitch Bend
 * **MIDI OUT:** validated through a physical DIN OUT-to-IN loopback; MIDI bytes are embedded at offset 480 of the `EP 0x05` playback packet
+* **SysEx:** long-message transport validated through the physical DIN loop with 80, 512, 1024 and 4096-byte messages recovered byte-for-byte (`cmp = 0`)
+* **MIDI output robustness:** ALSA rawmidi is refilled continuously beyond the original 64-byte chunk, shared output state is serialized across the four PCM OUT URBs, and embedded MIDI is paced to the physical DIN MIDI wire rate
 * **Coexistence:** audio playback and MIDI input validated simultaneously
 
 The AudioLink is not USB Audio Class compliant. The Linux driver performs the Ploytec vendor handshake, sample-rate control, device-specific bit-interleaved PCM encoding/decoding, MIDI input deframing and embedded MIDI output directly.

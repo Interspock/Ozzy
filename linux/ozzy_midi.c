@@ -27,20 +27,46 @@
  * fill_midi_out in URB handler context (atomic).
  */
 void ozzy_midi_consume(struct midi_runtime *rt, u8 *buffer, int count,
-		       u8 idle_byte)
+       u8 idle_byte)
 {
-	int i;
+int i;
+int ret;
+unsigned long flags;
 
-	for (i = 0; i < count; i++) {
-		if (rt->send_pending > 0) {
-			buffer[i] = rt->send_buffer[rt->send_count];
-			rt->send_count++;
-			rt->send_pending--;
-		} else {
-			rt->send_count = 0;
-			buffer[i] = idle_byte;
-		}
-	}
+spin_lock_irqsave(&rt->out_lock, flags);
+
+for (i = 0; i < count; i++) {
+
+/*
+ * Refill from ALSA whenever our staging buffer becomes empty.
+ * This allows long RawMIDI streams, including SysEx, to
+ * continue beyond the first chunk.
+ */
+if (rt->send_pending == 0) {
+rt->send_count = 0;
+
+if (rt->out) {
+ret = snd_rawmidi_transmit(
+rt->out,
+rt->send_buffer,
+OZZY_MIDI_SEND_BUF_SIZE
+);
+
+if (ret > 0)
+rt->send_pending = ret;
+}
+}
+
+if (rt->send_pending > 0) {
+buffer[i] = rt->send_buffer[rt->send_count];
+rt->send_count++;
+rt->send_pending--;
+} else {
+buffer[i] = idle_byte;
+}
+}
+
+spin_unlock_irqrestore(&rt->out_lock, flags);
 }
 
 /* ========================================================================
@@ -130,32 +156,17 @@ static void ozzy_midi_in_trigger(struct snd_rawmidi_substream *alsa_sub, int up)
  */
 static void ozzy_midi_out_trigger(struct snd_rawmidi_substream *alsa_sub, int up)
 {
-	struct midi_runtime *rt = alsa_sub->rmidi->private_data;
-	int ret;
-	unsigned long flags;
+struct midi_runtime *rt = alsa_sub->rmidi->private_data;
+unsigned long flags;
 
-	spin_lock_irqsave(&rt->out_lock, flags);
-	if (up) {
-		if (rt->out) {
-			spin_unlock_irqrestore(&rt->out_lock, flags);
-			return;
-		}
+spin_lock_irqsave(&rt->out_lock, flags);
 
-		ret = snd_rawmidi_transmit(alsa_sub, rt->out_buffer, 64);
-		if (ret > 0) {
-			if (rt->send_pending > (OZZY_MIDI_SEND_BUF_SIZE - ret)) {
-				ozzy_midi_notice(&rt->chip->dev->dev,
-					    "send buffer overflow\n");
-			} else {
-				memcpy(rt->send_buffer + rt->send_pending,
-				       rt->out_buffer, ret);
-				rt->send_pending += ret;
-			}
-		}
-	} else if (rt->out == alsa_sub) {
-		rt->out = NULL;
-	}
-	spin_unlock_irqrestore(&rt->out_lock, flags);
+if (up)
+rt->out = alsa_sub;
+else if (rt->out == alsa_sub)
+rt->out = NULL;
+
+spin_unlock_irqrestore(&rt->out_lock, flags);
 }
 
 static const struct snd_rawmidi_ops ozzy_midi_out_ops = {
@@ -286,15 +297,8 @@ int ozzy_midi_init(struct ozzy_chip *chip)
 	if (!rt)
 		return -ENOMEM;
 
-	rt->out_buffer = kzalloc(64, GFP_KERNEL);
-	if (!rt->out_buffer) {
-		kfree(rt);
-		return -ENOMEM;
-	}
-
 	rt->send_buffer = kzalloc(OZZY_MIDI_SEND_BUF_SIZE, GFP_KERNEL);
 	if (!rt->send_buffer) {
-		kfree(rt->out_buffer);
 		kfree(rt);
 		return -ENOMEM;
 	}
@@ -312,7 +316,6 @@ int ozzy_midi_init(struct ozzy_chip *chip)
 	if (ret < 0) {
 		ozzy_midi_err(&chip->dev->dev, "Cannot create MIDI instance\n");
 		kfree(rt->send_buffer);
-		kfree(rt->out_buffer);
 		kfree(rt);
 		return ret;
 	}
@@ -344,8 +347,7 @@ int ozzy_midi_init(struct ozzy_chip *chip)
 		if (ret < 0) {
 			ozzy_midi_err(&chip->dev->dev, "MIDI URB setup failed\n");
 			kfree(rt->send_buffer);
-			kfree(rt->out_buffer);
-			kfree(rt);
+				kfree(rt);
 			return ret;
 		}
 	}
