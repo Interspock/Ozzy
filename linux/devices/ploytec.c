@@ -702,6 +702,17 @@ static unsigned int audiolink_process_midi_in_packet(
 
     (void)chip;
 
+    /*
+     * After a USB reset / sample-rate change the AudioLink has been
+     * observed returning raw MIDI as short (often 1-byte) completions
+     * instead of the normal 5-byte framed records.
+     *
+     * Short transfers cannot contain a complete framed record, so pass
+     * them directly to ALSA as raw MIDI bytes.
+     */
+    if (length < 5)
+        return length;
+
     for (base = 0; base + 5 <= length; base += 5) {
         for (slot = 0; slot < 4; slot++) {
             uint8_t byte = buffer[base + slot];
